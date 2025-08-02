@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import os
 import shutil
 from uuid import uuid4
@@ -55,6 +55,74 @@ def cleanup_temp_directory(temp_dir: str):
             shutil.rmtree(temp_dir)
     except Exception as e:
         print(f"Warning: Could not clean up temp directory {temp_dir}: {e}")
+
+
+def add_filename_to_image(img: Image.Image, filename: str, page_number: int) -> Image.Image:
+    """Add professional filename label under the image for visa documentation"""
+
+    # Calculate new image size with space for text
+    margin = 60  # Space for text at bottom
+    new_width = img.width
+    new_height = img.height + margin
+
+    # Create new image with white background
+    new_img = Image.new('RGB', (new_width, new_height), 'white')
+
+    # Paste the original image at the top
+    new_img.paste(img, (0, 0))
+
+    # Draw text
+    draw = ImageDraw.Draw(new_img)
+
+    # Try to load a professional font, fallback to default
+    try:
+        # Try to use a system font for professional appearance
+        font_size = min(24, max(16, new_width // 40))  # Responsive font size
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+    except:
+        try:
+            font = ImageFont.truetype(
+                "/System/Library/Fonts/Helvetica.ttc", 20)
+        except:
+            font = ImageFont.load_default()
+
+    # Prepare text with page number and filename
+    clean_filename = os.path.splitext(filename)[0]  # Remove extension
+    text_line1 = f"Document {page_number}"
+    text_line2 = clean_filename
+
+    # Calculate text position (centered)
+    bbox1 = draw.textbbox((0, 0), text_line1, font=font)
+    bbox2 = draw.textbbox((0, 0), text_line2, font=font)
+    text1_width = bbox1[2] - bbox1[0]
+    text2_width = bbox2[2] - bbox2[0]
+
+    x1 = (new_width - text1_width) // 2
+    x2 = (new_width - text2_width) // 2
+    y1 = img.height + 5
+    y2 = y1 + 25
+
+    # Draw text with professional styling
+    # Add subtle shadow effect
+    shadow_offset = 1
+    draw.text((x1 + shadow_offset, y1 + shadow_offset),
+              text_line1, font=font, fill='#CCCCCC')
+    draw.text((x2 + shadow_offset, y2 + shadow_offset),
+              text_line2, font=font, fill='#CCCCCC')
+
+    # Draw main text
+    draw.text((x1, y1), text_line1, font=font,
+              fill='#2C3E50')  # Dark blue-gray
+    draw.text((x2, y2), text_line2, font=font,
+              fill='#34495E')  # Slightly lighter
+
+    # Add a subtle line separator
+    line_y = img.height + 2
+    draw.line([(new_width//4, line_y), (3*new_width//4, line_y)],
+              fill='#BDC3C7', width=1)
+
+    return new_img
 
 
 @app.post("/convert")
@@ -117,14 +185,19 @@ async def convert_to_pdf(files: list[UploadFile] = File(...)):
                     img = img.convert('RGB')
                     print(f"   🔄 Converted {img.mode} to RGB")
 
+                # Add professional filename label for visa documentation
+                img_with_label = add_filename_to_image(
+                    img, file.filename, processed_count + 1)
+                print(f"   📝 Added professional filename label")
+
                 # Accept any image dimensions - no validation
-                image_list.append(img)
+                image_list.append(img_with_label)
                 file_info.append({
                     "original_name": file.filename,
                     "ordered_name": ordered_filename,
                     "index": processed_count,
-                    "size": img.size,
-                    "mode": img.mode
+                    "size": img_with_label.size,
+                    "mode": img_with_label.mode
                 })
                 processed_count += 1
                 print(
@@ -160,14 +233,17 @@ async def convert_to_pdf(files: list[UploadFile] = File(...)):
         pdf_path = f"{temp_dir}/snapmerge_ordered.pdf"
 
         try:
-            # Save first image as PDF, then append the rest in order
+            # Create high-quality PDF for visa documentation
+            print(
+                f"📄 Creating professional PDF with {len(image_list)} documented images...")
+
             if len(image_list) == 1:
                 image_list[0].save(
                     pdf_path,
                     "PDF",
-                    quality=95,
-                    optimize=True,
-                    resolution=150.0
+                    quality=98,  # Higher quality for official documents
+                    optimize=False,  # Don't compress for better quality
+                    resolution=300.0  # High resolution for professional printing
                 )
             else:
                 # Ensure all images are in RGB mode for PDF compatibility
@@ -182,10 +258,13 @@ async def convert_to_pdf(files: list[UploadFile] = File(...)):
                     "PDF",
                     save_all=True,
                     append_images=rgb_images,
-                    quality=95,
-                    optimize=True,
-                    resolution=150.0
+                    quality=98,  # Higher quality for official documents
+                    optimize=False,  # Don't compress for better quality
+                    resolution=300.0  # High resolution for professional printing
                 )
+
+            print(f"✅ High-quality PDF created for visa documentation")
+
         except Exception as pdf_error:
             cleanup_temp_directory(temp_dir)
             return JSONResponse(
@@ -221,9 +300,9 @@ async def convert_to_pdf(files: list[UploadFile] = File(...)):
         asyncio.create_task(delayed_cleanup(
             temp_dir, delay_seconds=600))  # 10 minutes instead of 5
 
-        # Enhanced response headers with processing info
+        # Enhanced response headers with processing info for visa documentation
         response_headers = {
-            "Content-Disposition": f"attachment; filename=snapmerge_merged_{len(image_list)}_images.pdf",
+            "Content-Disposition": f"attachment; filename=immigration_visa_documents_{len(image_list)}_pages.pdf",
             "Cache-Control": "no-cache",
             "X-Processed-Images": str(len(image_list)),
             "X-Total-Files": str(len(files)),
@@ -233,7 +312,7 @@ async def convert_to_pdf(files: list[UploadFile] = File(...)):
         return FileResponse(
             pdf_path,
             media_type="application/pdf",
-            filename=f"snapmerge_merged_{len(image_list)}_images.pdf",
+            filename=f"immigration_visa_documents_{len(image_list)}_pages.pdf",
             headers=response_headers
         )
 
