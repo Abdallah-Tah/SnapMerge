@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw, ImageFont
@@ -7,6 +7,12 @@ import shutil
 from uuid import uuid4
 from typing import List
 import asyncio
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import inch
+from reportlab.lib.utils import ImageReader
+import io
+import PyPDF2
 
 app = FastAPI()
 
@@ -15,7 +21,56 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition",
+                    "X-Processed-Images", "X-Total-Files", "X-Skipped-Files"],
 )
+
+
+def optimize_image_for_pdf(img: Image.Image, max_width: int = 800, max_height: int = 1200, quality: int = 65) -> Image.Image:
+    """
+    Optimize image for PDF to reduce file size while maintaining quality for visa documents
+    """
+    # Convert to RGB if not already
+    if img.mode != 'RGB':
+        if img.mode in ('RGBA', 'LA', 'P'):
+            # Create white background for transparent images
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()
+                             [-1] if img.mode in ('RGBA', 'LA') else None)
+            img = background
+        else:
+            img = img.convert('RGB')
+
+    # Calculate new dimensions maintaining aspect ratio
+    width, height = img.size
+
+    # Only resize if image is larger than max dimensions
+    if width > max_width or height > max_height:
+        # Calculate scaling factor
+        width_ratio = max_width / width
+        height_ratio = max_height / height
+        scale_factor = min(width_ratio, height_ratio)
+
+        new_width = int(width * scale_factor)
+        new_height = int(height * scale_factor)
+
+        # Use LANCZOS for high-quality resizing
+        img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        print(
+            f"   📏 Resized from {width}x{height} to {new_width}x{new_height}")
+
+    # Apply additional compression by reducing quality slightly
+    # Save to bytes buffer with compression
+    buffer = io.BytesIO()
+    img.save(buffer, format='JPEG', quality=quality, optimize=True)
+    buffer.seek(0)
+
+    # Load back the compressed image
+    compressed_img = Image.open(buffer)
+
+    return compressed_img
 
 
 @app.get("/")
@@ -48,6 +103,29 @@ async def preview_file_order(files: list[UploadFile] = File(...)):
     }
 
 
+def generate_pdf_filename(file_info: list, image_count: int) -> str:
+    """Generate PDF filename using the same logic as the image labels"""
+
+    # If only one image, use the clean filename (same as image label)
+    if image_count == 1 and file_info:
+        original_name = file_info[0]['original_name']
+        # Use the same logic as add_filename_to_image function
+        clean_filename = os.path.splitext(original_name)[0]  # Remove extension
+        return f"{clean_filename}.pdf"
+
+    # For multiple images, create a descriptive name using the first image's clean filename
+    if file_info:
+        first_file = file_info[0]['original_name']
+        clean_filename = os.path.splitext(first_file)[0]  # Remove extension
+
+        # Add suffix for multiple documents
+        if image_count > 1:
+            return f"{clean_filename}_and_{image_count-1}_more_documents.pdf"
+
+    # Fallback
+    return f"merged_documents_{image_count}_pages.pdf"
+
+
 def cleanup_temp_directory(temp_dir: str):
     """Clean up temporary directory after processing"""
     try:
@@ -61,23 +139,26 @@ def add_filename_to_image(img: Image.Image, filename: str, page_number: int) -> 
     """Add professional filename label under the image for visa documentation"""
 
     # Calculate new image size with space for text
-    margin = 60  # Space for text at bottom
-    new_width = img.width
+    margin = 80  # Slightly reduced space for text at bottom
+    horizontal_padding = 30  # Equal padding from both sides
+    new_width = max(img.width, 800)  # Ensure minimum width for text
     new_height = img.height + margin
 
     # Create new image with white background
     new_img = Image.new('RGB', (new_width, new_height), 'white')
 
-    # Paste the original image at the top
-    new_img.paste(img, (0, 0))
+    # Calculate position to center the original image
+    x_offset = (new_width - img.width) // 2
+    new_img.paste(img, (x_offset, 0))
 
     # Draw text
     draw = ImageDraw.Draw(new_img)
 
     # Try to load a professional font, fallback to default
     try:
-        # Try to use a system font for professional appearance
-        font_size = min(24, max(16, new_width // 40))  # Responsive font size
+        # Adjust font size based on image width while ensuring readability
+        # Adjusted font size calculation
+        font_size = min(32, max(18, new_width // 50))
         font = ImageFont.truetype(
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
     except:
@@ -87,46 +168,192 @@ def add_filename_to_image(img: Image.Image, filename: str, page_number: int) -> 
         except:
             font = ImageFont.load_default()
 
-    # Prepare text with page number and filename
+    # Prepare text with filename only
     clean_filename = os.path.splitext(filename)[0]  # Remove extension
-    text_line1 = f"Document {page_number}"
-    text_line2 = clean_filename
+    text = clean_filename
 
-    # Calculate text position (centered)
-    bbox1 = draw.textbbox((0, 0), text_line1, font=font)
-    bbox2 = draw.textbbox((0, 0), text_line2, font=font)
-    text1_width = bbox1[2] - bbox1[0]
-    text2_width = bbox2[2] - bbox2[0]
+    # Calculate text size to ensure it fits
+    text = clean_filename
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
 
-    x1 = (new_width - text1_width) // 2
-    x2 = (new_width - text2_width) // 2
-    y1 = img.height + 5
-    y2 = y1 + 25
+    # If text is too wide, try to shrink it
+    max_width = new_width - (2 * horizontal_padding)
+    if text_width > max_width:
+        # Reduce font size until it fits
+        while text_width > max_width and font_size > 12:
+            font_size -= 2
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+
+    # Calculate position to center the text
+    x = (new_width - text_width) // 2  # Center horizontally
+    # Center vertically in margin area
+    y = img.height + (margin - text_height) // 2
 
     # Draw text with professional styling
-    # Add subtle shadow effect
-    shadow_offset = 1
-    draw.text((x1 + shadow_offset, y1 + shadow_offset),
-              text_line1, font=font, fill='#CCCCCC')
-    draw.text((x2 + shadow_offset, y2 + shadow_offset),
-              text_line2, font=font, fill='#CCCCCC')
+    # Enhanced shadow effect for better readability
+    shadow_offset = 2
+    shadow_color = '#BBBBBB'  # Slightly lighter shadow for professional look
 
-    # Draw main text
-    draw.text((x1, y1), text_line1, font=font,
-              fill='#2C3E50')  # Dark blue-gray
-    draw.text((x2, y2), text_line2, font=font,
-              fill='#34495E')  # Slightly lighter
+    # Draw shadow with multiple layers for depth
+    for offset in range(shadow_offset):
+        draw.text((x + offset, y + offset),
+                  text, font=font, fill=shadow_color)
 
-    # Add a subtle line separator
-    line_y = img.height + 2
-    draw.line([(new_width//4, line_y), (3*new_width//4, line_y)],
-              fill='#BDC3C7', width=1)
+    # Draw main text with professional styling
+    draw.text((x, y), text, font=font,
+              fill='#1A365D')  # Rich navy blue for professional look
 
     return new_img
 
 
+def create_professional_pdf(image_list: List[Image.Image], pdf_path: str, file_info: List[dict]):
+    """Create a professional PDF using ReportLab for consulate documents"""
+
+    # A4 page dimensions in points (1 point = 1/72 inch)
+    page_width, page_height = A4
+    margin = 0.5 * inch  # 0.5 inch margins
+    usable_width = page_width - (2 * margin)
+    usable_height = page_height - (2 * margin)
+
+    # Create the PDF canvas
+    c = canvas.Canvas(pdf_path, pagesize=A4)
+
+    # Set PDF metadata for official documents
+    # c.setTitle("Immigration Visa Documents")
+    # c.setAuthor("SnapMerge Document Converter")
+    # c.setSubject("Official Immigration Documentation")
+    # c.setKeywords("visa, immigration, documents, official")
+
+    for i, img in enumerate(image_list):
+        if i > 0:  # Add new page for each image after the first
+            c.showPage()
+
+        # Convert PIL image to bytes for ReportLab with compression
+        img_buffer = io.BytesIO()
+        # Use JPEG with lower quality for smaller file size
+        img.save(img_buffer, format='JPEG', quality=70, optimize=True)
+        img_buffer.seek(0)
+
+        # Create ImageReader object
+        img_reader = ImageReader(img_buffer)
+
+        # Calculate scaling to fit page while maintaining aspect ratio
+        img_width_px, img_height_px = img.size
+
+        # Calculate the maximum size that fits on the page
+        scale_w = usable_width / img_width_px
+        scale_h = usable_height / img_height_px
+        # Use the smaller scale to fit both dimensions
+        scale = min(scale_w, scale_h)
+
+        # Calculate final dimensions
+        final_width = img_width_px * scale
+        final_height = img_height_px * scale
+
+        # Center the image on the page
+        x_offset = margin + (usable_width - final_width) / 2
+        y_offset = margin + (usable_height - final_height) / 2
+
+        # Draw the image at high resolution
+        c.drawImage(
+            img_reader,
+            x_offset,
+            y_offset,
+            width=final_width,
+            height=final_height,
+            preserveAspectRatio=True,
+            anchor='c'
+        )
+
+        # Add professional header
+        # c.setFont("Helvetica-Bold", 12)
+        # c.drawString(margin, page_height - 30, "OFFICIAL IMMIGRATION DOCUMENT")
+
+        # Add page number and document info
+        # c.setFont("Helvetica", 10)
+        # page_info = f"Page {i + 1} of {len(image_list)}"
+        # if i < len(file_info):
+        #     page_info += f" - {file_info[i]['original_name']}"
+
+        # c.drawRightString(page_width - margin, page_height - 30, page_info)
+
+        # Add footer with timestamp and system info
+        c.setFont("Helvetica", 8)
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+        # footer_text = f"Generated by SnapMerge on {timestamp} - High Resolution: 300 DPI"
+
+        # Calculate centered position for footer text
+        # text_width = c.stringWidth(footer_text, "Helvetica", 8)
+        # footer_x = (page_width - text_width) / 2
+        # c.drawString(footer_x, 20, footer_text)
+
+        # Add quality assurance note
+        # c.setFont("Helvetica", 7)
+        # quality_note = "This document maintains original image quality and resolution for official use"
+
+        # # Calculate centered position for quality note
+        # quality_width = c.stringWidth(quality_note, "Helvetica", 7)
+        # quality_x = (page_width - quality_width) / 2
+        # c.drawString(quality_x, 10, quality_note)
+
+    # Save the PDF with compression
+    c.save()
+
+    # Apply additional PDF compression to reduce file size
+    compress_pdf(pdf_path)
+
+    print(
+        f"✅ Compressed PDF created: {len(image_list)} pages optimized for small file size")
+
+
+def compress_pdf(pdf_path: str):
+    """Compress PDF file to reduce size"""
+    try:
+        # Read the original PDF
+        with open(pdf_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            writer = PyPDF2.PdfWriter()
+
+            # Copy pages with compression
+            for page in reader.pages:
+                # Remove unnecessary data and compress
+                page.compress_content_streams()
+                writer.add_page(page)
+
+            # Set compression options
+            # writer.add_metadata({
+            #     '/Title': 'Immigration Visa Documents - Compressed',
+            #     '/Subject': 'Official Immigration Documentation',
+            #     '/Creator': 'SnapMerge Document Converter'
+            # })
+
+            # Write compressed PDF
+            temp_path = pdf_path + '.tmp'
+            with open(temp_path, 'wb') as output_file:
+                writer.write(output_file)
+
+        # Replace original with compressed version
+        import shutil
+        shutil.move(temp_path, pdf_path)
+        print(f"   📦 PDF compressed successfully")
+
+    except Exception as e:
+        print(f"   ⚠️  PDF compression failed: {e}")
+        # If compression fails, continue with original PDF
+
+
 @app.post("/convert")
-async def convert_to_pdf(files: list[UploadFile] = File(...)):
+async def convert_to_pdf(
+    files: list[UploadFile] = File(...),
+    mode: str = Form('merge')  # 'merge' or 'split'
+):
     if not files:
         return {"error": "No files provided"}
 
@@ -168,22 +395,14 @@ async def convert_to_pdf(files: list[UploadFile] = File(...)):
             # Try to process as image - force processing even if validation fails
             try:
                 img = Image.open(path)
+                original_size = img.size
                 print(
-                    f"   🖼️  Valid image: {img.size} pixels, mode: {img.mode}")
+                    f"   🖼️  Original image: {img.size} pixels, mode: {img.mode}")
 
-                # Handle various image formats and modes
-                if img.mode in ('RGBA', 'LA', 'P'):
-                    # Create a white background for transparent images
-                    background = Image.new('RGB', img.size, (255, 255, 255))
-                    if img.mode == 'P':
-                        img = img.convert('RGBA')
-                    background.paste(img, mask=img.split(
-                    )[-1] if img.mode in ('RGBA', 'LA') else None)
-                    img = background
-                    print(f"   🔄 Converted transparent/palette image to RGB")
-                elif img.mode != 'RGB':
-                    img = img.convert('RGB')
-                    print(f"   🔄 Converted {img.mode} to RGB")
+                # Optimize image for PDF (resize + compress)
+                img = optimize_image_for_pdf(
+                    img, max_width=800, max_height=1200, quality=60)
+                print(f"   ✅ Optimized: {original_size} → {img.size} pixels")
 
                 # Add professional filename label for visa documentation
                 img_with_label = add_filename_to_image(
@@ -229,41 +448,46 @@ async def convert_to_pdf(files: list[UploadFile] = File(...)):
                 content={"error": error_msg, "skipped_files": skipped_files}
             )
 
-        # Create PDF with images in the exact upload order
+        # Handle split or merge modes
+        if mode == 'split':
+            # Generate a PDF per image and zip them
+            zip_path = os.path.join(temp_dir, 'split_documents.zip')
+            import zipfile
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for i, img in enumerate(image_list):
+                    info = file_info[i]
+                    # single PDF for this image
+                    single_name = os.path.splitext(
+                        info['original_name'])[0] + '.pdf'
+                    single_path = os.path.join(temp_dir, single_name)
+                    create_professional_pdf([img], single_path, [info])
+                    zf.write(single_path, arcname=single_name)
+            # Schedule cleanup
+            asyncio.create_task(delayed_cleanup(temp_dir, delay_seconds=600))
+            # Return zip file
+            return FileResponse(
+                zip_path,
+                media_type='application/zip',
+                headers={
+                    'Content-Disposition': f"attachment; filename=split_documents.zip",
+                    'Cache-Control': 'no-cache',
+                    'X-Processed-Images': str(len(image_list)),
+                    'X-Total-Files': str(len(files)),
+                    'X-Skipped-Files': str(len(skipped_files))
+                }
+            )
+        # Merge mode: create one PDF with all images
         pdf_path = f"{temp_dir}/snapmerge_ordered.pdf"
 
         try:
-            # Create high-quality PDF for visa documentation
+            # Create professional PDF using ReportLab for consulate documents
             print(
                 f"📄 Creating professional PDF with {len(image_list)} documented images...")
 
-            if len(image_list) == 1:
-                image_list[0].save(
-                    pdf_path,
-                    "PDF",
-                    quality=98,  # Higher quality for official documents
-                    optimize=False,  # Don't compress for better quality
-                    resolution=300.0  # High resolution for professional printing
-                )
-            else:
-                # Ensure all images are in RGB mode for PDF compatibility
-                rgb_images = []
-                for img in image_list[1:]:
-                    if img.mode != 'RGB':
-                        img = img.convert('RGB')
-                    rgb_images.append(img)
+            # Use ReportLab for better control and professional output
+            create_professional_pdf(image_list, pdf_path, file_info)
 
-                image_list[0].save(
-                    pdf_path,
-                    "PDF",
-                    save_all=True,
-                    append_images=rgb_images,
-                    quality=98,  # Higher quality for official documents
-                    optimize=False,  # Don't compress for better quality
-                    resolution=300.0  # High resolution for professional printing
-                )
-
-            print(f"✅ High-quality PDF created for visa documentation")
+            print(f"✅ Professional PDF created with ReportLab for consulate submission")
 
         except Exception as pdf_error:
             cleanup_temp_directory(temp_dir)
@@ -300,9 +524,19 @@ async def convert_to_pdf(files: list[UploadFile] = File(...)):
         asyncio.create_task(delayed_cleanup(
             temp_dir, delay_seconds=600))  # 10 minutes instead of 5
 
+        # Generate meaningful PDF filename based on input images
+        pdf_filename = generate_pdf_filename(file_info, len(image_list))
+        print(f"🏷️  Generated PDF filename: {pdf_filename}")
+        print(
+            f"📁 File info for filename generation: {[f['original_name'] for f in file_info]}")
+
         # Enhanced response headers with processing info for visa documentation
+        # Properly encode filename for Content-Disposition header
+        import urllib.parse
+        encoded_filename = urllib.parse.quote(pdf_filename)
+
         response_headers = {
-            "Content-Disposition": f"attachment; filename=immigration_visa_documents_{len(image_list)}_pages.pdf",
+            "Content-Disposition": f'attachment; filename="{pdf_filename}"; filename*=UTF-8\'\'{encoded_filename}',
             "Cache-Control": "no-cache",
             "X-Processed-Images": str(len(image_list)),
             "X-Total-Files": str(len(files)),
@@ -312,7 +546,6 @@ async def convert_to_pdf(files: list[UploadFile] = File(...)):
         return FileResponse(
             pdf_path,
             media_type="application/pdf",
-            filename=f"immigration_visa_documents_{len(image_list)}_pages.pdf",
             headers=response_headers
         )
 
